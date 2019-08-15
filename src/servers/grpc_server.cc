@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <queue>
 #include <thread>
 #include "grpc++/security/server_credentials.h"
 #include "grpc++/server.h"
@@ -74,8 +75,8 @@ class Barrier {
 };
 
 // The step of processing that the state is in. Every state must
-// recognize START, PROCESS1 and FINISH and the others are optional.
-typedef enum { START, PROCESS1, PROCESS2, FINISH } Steps;
+// recognize START, COMPLETE and FINISH and the others are optional.
+typedef enum { START, COMPLETE, FINISH, ISSUED, READ, WRITE } Steps;
 
 std::ostream&
 operator<<(std::ostream& out, const Steps& step)
@@ -84,14 +85,20 @@ operator<<(std::ostream& out, const Steps& step)
     case START:
       out << "START";
       break;
-    case PROCESS1:
-      out << "PROCESS1";
-      break;
-    case PROCESS2:
-      out << "PROCESS2";
+    case COMPLETE:
+      out << "COMPLETE";
       break;
     case FINISH:
       out << "FINISH";
+      break;
+    case ISSUED:
+      out << "ISSUED";
+      break;
+    case READ:
+      out << "READ";
+      break;
+    case WRITE:
+      out << "WRITE";
       break;
   }
 
@@ -99,9 +106,55 @@ operator<<(std::ostream& out, const Steps& step)
 }
 
 //
+// HandlerState
+//
+template <
+    typename ServerResponderType, typename RequestType, typename ResponseType>
+class HandlerState {
+ public:
+  struct RequestResponse {
+    RequestType request_;
+    ResponseType response_;
+  };
+
+  HandlerState(const char* server_id, std::unique_ptr<RequestResponse>* req_resp)
+  : server_id_(server_id), step_(Steps::START)
+  {
+    unique_id_ = RequestStatusUtil::NextUniqueRequestId();
+
+    ctx_.reset(new grpc::ServerContext());
+    responder_.reset(new ServerResponderType(ctx_.get()));
+
+    req_resp_.emplace(*req_resp);
+  }
+
+  const char* const server_id_;
+  uint64_t unique_id_;
+  Steps step_;
+
+  // Context for the rpc, allowing to tweak aspects of it such as
+  // the use of compression, authentication, as well as to send
+  // metadata back to the client.
+  std::unique_ptr<grpc::ServerContext> ctx_;
+  std::unique_ptr<ServerResponderType> responder_;
+
+  // The request/response pairs associated with this state. For
+  // non-streaming there will only be a single pair. For streaming
+  // case can be multiple pairs since there can be many inflight
+  // requests for the stream represented by this state. The mutex is
+  // only needed if the state can be accessed by only a single thread
+  // at a time (e.g. Infer has callback thread different from thread
+  // handling GRPC request).
+  std::mutex mu_;
+  std::queue<std::unique_ptr<RequestResponse>> req_resp_;
+};
+
+//
 // Handler
 //
-template <typename ServiceType, typename RequestType, typename ResponseType>
+template <
+    typename ServiceType, typename ServerResponderType, typename RequestType,
+    typename ResponseType>
 class Handler : public GRPCServer::HandlerBase {
  public:
   Handler(
@@ -122,40 +175,7 @@ class Handler : public GRPCServer::HandlerBase {
   void Stop();
 
  protected:
-  class State {
-   public:
-    State(const char* server_id) : server_id_(server_id) { Reset(); }
-
-    // Reset the state for a new request.
-    void Reset()
-    {
-      // It's important to delete the existing responder_ before the
-      // ctx_ or else can get spurious memory corruption.
-      responder_.reset();
-      ctx_.reset(new grpc::ServerContext());
-      responder_.reset(
-          new grpc::ServerAsyncResponseWriter<ResponseType>(ctx_.get()));
-
-      unique_id_ = RequestStatusUtil::NextUniqueRequestId();
-      step_ = START;
-      request_.Clear();
-      response_.Clear();
-    }
-
-    // Context for the rpc, allowing to tweak aspects of it such as
-    // the use of compression, authentication, as well as to send
-    // metadata back to the client.
-    std::unique_ptr<grpc::ServerContext> ctx_;
-    std::unique_ptr<grpc::ServerAsyncResponseWriter<ResponseType>> responder_;
-
-    RequestType request_;
-    ResponseType response_;
-
-    const char* const server_id_;
-    uint64_t unique_id_;
-
-    Steps step_;
-  };
+  using State = HandlerState<ServerResponderType, RequestType, ResponseType>;
 
   State* StateNew()
   {
@@ -206,8 +226,10 @@ class Handler : public GRPCServer::HandlerBase {
   std::vector<State*> state_bucket_;
 };
 
-template <typename ServiceType, typename RequestType, typename ResponseType>
-Handler<ServiceType, RequestType, ResponseType>::Handler(
+template <
+    typename ServiceType, typename ServerResponderType, typename RequestType,
+    typename ResponseType>
+Handler<ServiceType, ServerResponderType, RequestType, ResponseType>::Handler(
     const std::string& name, const std::shared_ptr<TRTSERVER_Server>& trtserver,
     const char* server_id,
     const std::shared_ptr<SharedMemoryBlockManager>& smb_manager,
@@ -219,8 +241,10 @@ Handler<ServiceType, RequestType, ResponseType>::Handler(
 {
 }
 
-template <typename ServiceType, typename RequestType, typename ResponseType>
-Handler<ServiceType, RequestType, ResponseType>::~Handler()
+template <
+    typename ServiceType, typename ServerResponderType, typename RequestType,
+    typename ResponseType>
+Handler<ServiceType, ServerResponderType, RequestType, ResponseType>::~Handler()
 {
   for (State* state : state_bucket_) {
     delete state;
@@ -230,9 +254,12 @@ Handler<ServiceType, RequestType, ResponseType>::~Handler()
   LOG_VERBOSE(1) << "Destructed " << Name();
 }
 
-template <typename ServiceType, typename RequestType, typename ResponseType>
+template <
+    typename ServiceType, typename ServerResponderType, typename RequestType,
+    typename ResponseType>
 void
-Handler<ServiceType, RequestType, ResponseType>::Start(int thread_cnt)
+Handler<ServiceType, ServerResponderType, RequestType, ResponseType>::Start(
+    int thread_cnt)
 {
   // Use a barrier to make sure we don't return until all threads have
   // started.
@@ -260,9 +287,11 @@ Handler<ServiceType, RequestType, ResponseType>::Start(int thread_cnt)
   LOG_VERBOSE(1) << "Threads started for " << Name();
 }
 
-template <typename ServiceType, typename RequestType, typename ResponseType>
+template <
+    typename ServiceType, typename ServerResponderType, typename RequestType,
+    typename ResponseType>
 void
-Handler<ServiceType, RequestType, ResponseType>::Stop()
+Handler<ServiceType, ServerResponderType, RequestType, ResponseType>::Stop()
 {
   for (const auto& thread : threads_) {
     thread->join();
@@ -274,8 +303,10 @@ Handler<ServiceType, RequestType, ResponseType>::Stop()
 //
 // HealthHandler
 //
-class HealthHandler
-    : public Handler<GRPCService::AsyncService, HealthRequest, HealthResponse> {
+class HealthHandler : public Handler<
+                          GRPCService::AsyncService,
+                          grpc::ServerAsyncResponseWriter<HealthResponse>,
+                          HealthRequest, HealthResponse> {
  public:
   HealthHandler(
       const std::string& name,
@@ -300,8 +331,11 @@ HealthHandler::StartNewRequest()
   LOG_VERBOSE(1) << "New request handler for " << Name();
 
   State* state = StateNew();
+  const std::unique_ptr<State::RequestResponse>& req_resp = state->req_resp_.front();
+  HealthRequest& request = req_resp->request_;
+
   service_->RequestHealth(
-      state->ctx_.get(), &state->request_, state->responder_.get(), cq_, cq_,
+      state->ctx_.get(), &request, state->responder_.get(), cq_, cq_,
       state);
 }
 
@@ -320,32 +354,36 @@ HealthHandler::Process(Handler::State* state, bool rpc_ok)
     state->step_ = Steps::FINISH;
   }
 
+  const std::unique_ptr<State::RequestResponse>& req_resp = state->req_resp_.front();
+  const HealthRequest& request = req_resp->request_;
+  HealthResponse& response = req_resp->response_;
+
   if (state->step_ == Steps::START) {
     TRTSERVER_Error* err = nullptr;
     bool health = false;
 
-    if (state->request_.mode() == "live") {
+    if (request.mode() == "live") {
       err = TRTSERVER_ServerIsLive(trtserver_.get(), &health);
-    } else if (state->request_.mode() == "ready") {
+    } else if (request.mode() == "ready") {
       err = TRTSERVER_ServerIsReady(trtserver_.get(), &health);
     } else {
       err = TRTSERVER_ErrorNew(
           TRTSERVER_ERROR_UNKNOWN,
-          std::string("unknown health mode '" + state->request_.mode() + "'")
+          std::string("unknown health mode '" + request.mode() + "'")
               .c_str());
     }
 
-    state->response_.set_health((err == nullptr) && health);
+    response.set_health((err == nullptr) && health);
 
     RequestStatusUtil::Create(
-        state->response_.mutable_request_status(), err, state->unique_id_,
+        response.mutable_request_status(), err, state->unique_id_,
         server_id_);
 
     TRTSERVER_ErrorDelete(err);
 
-    state->step_ = Steps::PROCESS1;
-    state->responder_->Finish(state->response_, grpc::Status::OK, state);
-  } else if (state->step_ == Steps::PROCESS1) {
+    state->step_ = Steps::COMPLETE;
+    state->responder_->Finish(response, grpc::Status::OK, state);
+  } else if (state->step_ == Steps::COMPLETE) {
     state->step_ = Steps::FINISH;
   }
 
@@ -362,8 +400,10 @@ HealthHandler::Process(Handler::State* state, bool rpc_ok)
 //
 // StatusHandler
 //
-class StatusHandler
-    : public Handler<GRPCService::AsyncService, StatusRequest, StatusResponse> {
+class StatusHandler : public Handler<
+                          GRPCService::AsyncService,
+                          grpc::ServerAsyncResponseWriter<StatusResponse>,
+                          StatusRequest, StatusResponse> {
  public:
   StatusHandler(
       const std::string& name,
@@ -389,7 +429,7 @@ StatusHandler::StartNewRequest()
 
   State* state = StateNew();
   service_->RequestStatus(
-      state->ctx_.get(), &state->request_, state->responder_.get(), cq_, cq_,
+      state->ctx_.get(), &state->req_resp_.request_, state->responder_.get(), cq_, cq_,
       state);
 }
 
@@ -411,10 +451,10 @@ StatusHandler::Process(Handler::State* state, bool rpc_ok)
   if (state->step_ == Steps::START) {
     TRTSERVER_Protobuf* server_status_protobuf = nullptr;
     TRTSERVER_Error* err =
-        (state->request_.model_name().empty())
+        (state->req_resp_.request_.model_name().empty())
             ? TRTSERVER_ServerStatus(trtserver_.get(), &server_status_protobuf)
             : TRTSERVER_ServerModelStatus(
-                  trtserver_.get(), state->request_.model_name().c_str(),
+                  trtserver_.get(), state->req_resp_.request_.model_name().c_str(),
                   &server_status_protobuf);
     if (err == nullptr) {
       const char* status_buffer;
@@ -422,7 +462,7 @@ StatusHandler::Process(Handler::State* state, bool rpc_ok)
       err = TRTSERVER_ProtobufSerialize(
           server_status_protobuf, &status_buffer, &status_byte_size);
       if (err == nullptr) {
-        if (!state->response_.mutable_server_status()->ParseFromArray(
+        if (!state->req_resp_.response_.mutable_server_status()->ParseFromArray(
                 status_buffer, status_byte_size)) {
           err = TRTSERVER_ErrorNew(
               TRTSERVER_ERROR_UNKNOWN, "failed to parse server status");
@@ -433,14 +473,14 @@ StatusHandler::Process(Handler::State* state, bool rpc_ok)
     TRTSERVER_ProtobufDelete(server_status_protobuf);
 
     RequestStatusUtil::Create(
-        state->response_.mutable_request_status(), err, state->unique_id_,
+        state->req_resp_.response_.mutable_request_status(), err, state->unique_id_,
         server_id_);
 
     TRTSERVER_ErrorDelete(err);
 
-    state->step_ = Steps::PROCESS1;
-    state->responder_->Finish(state->response_, grpc::Status::OK, state);
-  } else if (state->step_ == Steps::PROCESS1) {
+    state->step_ = Steps::COMPLETE;
+    state->responder_->Finish(state->req_resp_.response_, grpc::Status::OK, state);
+  } else if (state->step_ == Steps::COMPLETE) {
     state->step_ = Steps::FINISH;
   }
 
@@ -455,147 +495,10 @@ StatusHandler::Process(Handler::State* state, bool rpc_ok)
 }
 
 //
-// InferHandler
+// Infer utilities
 //
-class InferHandler
-    : public Handler<GRPCService::AsyncService, InferRequest, InferResponse> {
- public:
-  InferHandler(
-      const std::string& name,
-      const std::shared_ptr<TRTSERVER_Server>& trtserver, const char* server_id,
-      const std::shared_ptr<SharedMemoryBlockManager>& smb_manager,
-      GRPCService::AsyncService* service, grpc::ServerCompletionQueue* cq,
-      size_t max_state_bucket_count)
-      : Handler(
-            name, trtserver, server_id, smb_manager, service, cq,
-            max_state_bucket_count)
-  {
-    // Create the allocator that will be used to allocate buffers for
-    // the result tensors.
-    FAIL_IF_ERR(
-        TRTSERVER_ResponseAllocatorNew(
-            &allocator_, ResponseAlloc, ResponseRelease),
-        "creating response allocator");
-  }
-
- protected:
-  void StartNewRequest();
-  Steps Process(State* state, bool rpc_ok);
-
- private:
-  static TRTSERVER_Error* ResponseAlloc(
-      TRTSERVER_ResponseAllocator* allocator, void** buffer,
-      void** buffer_userp, const char* tensor_name, size_t byte_size,
-      TRTSERVER_Memory_Type memory_type, int64_t memory_type_id, void* userp);
-  static TRTSERVER_Error* ResponseRelease(
-      TRTSERVER_ResponseAllocator* allocator, void* buffer, void* buffer_userp,
-      size_t byte_size, TRTSERVER_Memory_Type memory_type,
-      int64_t memory_type_id);
-  static void InferComplete(
-      TRTSERVER_Server* server, TRTSERVER_InferenceResponse* response,
-      void* userp);
-  TRTSERVER_Error* GRPCToInput(
-      const InferRequestHeader& request_header, const InferRequest& request,
-      TRTSERVER_InferenceRequestProvider* request_provider);
-
-  TRTSERVER_ResponseAllocator* allocator_;
-};
-
-void
-InferHandler::StartNewRequest()
-{
-  LOG_VERBOSE(1) << "New request handler for " << Name();
-
-  State* state = StateNew();
-  service_->RequestInfer(
-      state->ctx_.get(), &state->request_, state->responder_.get(), cq_, cq_,
-      state);
-}
-
-Steps
-InferHandler::Process(Handler::State* state, bool rpc_ok)
-{
-  LOG_VERBOSE(1) << "Process for " << Name() << ", rpc_ok=" << rpc_ok
-                 << ", step " << state->step_;
-
-  // If RPC failed on a new request then the server is shutting down
-  // and so we should do nothing (including not registering for a new
-  // request). If RPC failed on a non-START step then there is nothing
-  // we can do since we one execute one step.
-  const bool shutdown = (!rpc_ok && (state->step_ == Steps::START));
-  if (shutdown) {
-    state->step_ = Steps::FINISH;
-  }
-
-  if (state->step_ == Steps::START) {
-    // Start a new request to replace this one...
-    if (!shutdown) {
-      StartNewRequest();
-    }
-
-    TRTSERVER_Error* err = nullptr;
-
-    std::string request_header_serialized;
-    if (!state->request_.meta_data().SerializeToString(
-            &request_header_serialized)) {
-      err = TRTSERVER_ErrorNew(
-          TRTSERVER_ERROR_UNKNOWN, "failed to serialize request header");
-    } else {
-      // Create the inference request provider which provides all the
-      // input information needed for an inference.
-      TRTSERVER_InferenceRequestProvider* request_provider = nullptr;
-      err = TRTSERVER_InferenceRequestProviderNew(
-          &request_provider, trtserver_.get(),
-          state->request_.model_name().c_str(), state->request_.model_version(),
-          request_header_serialized.c_str(), request_header_serialized.size());
-      if (err == nullptr) {
-        err = GRPCToInput(
-            state->request_.meta_data(), state->request_, request_provider);
-        if (err == nullptr) {
-          state->step_ = PROCESS1;
-          err = TRTSERVER_ServerInferAsync(
-              trtserver_.get(), request_provider, allocator_,
-              &state->response_ /* response_allocator_userp */, InferComplete,
-              reinterpret_cast<void*>(state));
-
-          // The request provider can be deleted immediately after the
-          // ServerInferAsync call returns.
-          TRTSERVER_InferenceRequestProviderDelete(request_provider);
-        }
-      }
-    }
-
-    // If not error then state->step_ == PROCESS1 and inference request
-    // has initiated... completion callback will transition to
-    // PROCESS2. If error go immediately to PROCESS2.
-    if (err != nullptr) {
-      RequestStatusUtil::Create(
-          state->response_.mutable_request_status(), err, state->unique_id_,
-          server_id_);
-
-      LOG_VERBOSE(1) << "Infer failed: " << TRTSERVER_ErrorMessage(err);
-      TRTSERVER_ErrorDelete(err);
-
-      // Clear the meta-data and raw output as they may be partially
-      // or un-initialized.
-      state->response_.mutable_meta_data()->Clear();
-      state->response_.mutable_raw_output()->Clear();
-
-      state->response_.mutable_meta_data()->set_id(
-          state->request_.meta_data().id());
-
-      state->step_ = PROCESS2;
-      state->responder_->Finish(state->response_, grpc::Status::OK, state);
-    }
-  } else if (state->step_ == Steps::PROCESS2) {
-    state->step_ = Steps::FINISH;
-  }
-
-  return state->step_;
-}
-
 TRTSERVER_Error*
-InferHandler::ResponseAlloc(
+InferResponseAlloc(
     TRTSERVER_ResponseAllocator* allocator, void** buffer, void** buffer_userp,
     const char* tensor_name, size_t byte_size,
     TRTSERVER_Memory_Type memory_type, int64_t memory_type_id, void* userp)
@@ -630,7 +533,7 @@ InferHandler::ResponseAlloc(
 }
 
 TRTSERVER_Error*
-InferHandler::ResponseRelease(
+InferResponseRelease(
     TRTSERVER_ResponseAllocator* allocator, void* buffer, void* buffer_userp,
     size_t byte_size, TRTSERVER_Memory_Type memory_type, int64_t memory_type_id)
 {
@@ -643,7 +546,9 @@ InferHandler::ResponseRelease(
 }
 
 TRTSERVER_Error*
-InferHandler::GRPCToInput(
+InferGRPCToInput(
+    const std::shared_ptr<TRTSERVER_Server>& trtserver,
+    const std::shared_ptr<SharedMemoryBlockManager>& smb_manager,
     const InferRequestHeader& request_header, const InferRequest& request,
     TRTSERVER_InferenceRequestProvider* request_provider)
 {
@@ -676,9 +581,9 @@ InferHandler::GRPCToInput(
     if (io.has_shared_memory()) {
       LOG_VERBOSE(1) << io.name() << " has shared memory";
       TRTSERVER_SharedMemoryBlock* smb = nullptr;
-      RETURN_IF_ERR(smb_manager_->Get(&smb, io.shared_memory().name()));
+      RETURN_IF_ERR(smb_manager->Get(&smb, io.shared_memory().name()));
       RETURN_IF_ERR(TRTSERVER_ServerSharedMemoryAddress(
-          trtserver_.get(), smb, io.shared_memory().offset(),
+          trtserver.get(), smb, io.shared_memory().offset(),
           io.shared_memory().byte_size(), const_cast<void**>(&base)));
       byte_size = io.shared_memory().byte_size();
     } else {
@@ -708,25 +613,162 @@ InferHandler::GRPCToInput(
   return nullptr;  // success
 }
 
+//
+// InferHandler
+//
+class InferHandler : public Handler<
+                         GRPCService::AsyncService,
+                         grpc::ServerAsyncResponseWriter<InferResponse>,
+                         InferRequest, InferResponse> {
+ public:
+  InferHandler(
+      const std::string& name,
+      const std::shared_ptr<TRTSERVER_Server>& trtserver, const char* server_id,
+      const std::shared_ptr<SharedMemoryBlockManager>& smb_manager,
+      GRPCService::AsyncService* service, grpc::ServerCompletionQueue* cq,
+      size_t max_state_bucket_count)
+      : Handler(
+            name, trtserver, server_id, smb_manager, service, cq,
+            max_state_bucket_count)
+  {
+    // Create the allocator that will be used to allocate buffers for
+    // the result tensors.
+    FAIL_IF_ERR(
+        TRTSERVER_ResponseAllocatorNew(
+            &allocator_, InferResponseAlloc, InferResponseRelease),
+        "creating response allocator");
+  }
+
+ protected:
+  void StartNewRequest();
+  Steps Process(State* state, bool rpc_ok);
+
+ private:
+  static void InferComplete(
+      TRTSERVER_Server* server, TRTSERVER_InferenceResponse* response,
+      void* userp);
+
+  TRTSERVER_ResponseAllocator* allocator_;
+};
+
+void
+InferHandler::StartNewRequest()
+{
+  LOG_VERBOSE(1) << "New request handler for " << Name();
+
+  State* state = StateNew();
+  service_->RequestInfer(
+      state->ctx_.get(), &state->req_resp_.request_, state->responder_.get(), cq_, cq_,
+      state);
+}
+
+Steps
+InferHandler::Process(Handler::State* state, bool rpc_ok)
+{
+  LOG_VERBOSE(1) << "Process for " << Name() << ", rpc_ok=" << rpc_ok
+                 << ", step " << state->step_;
+
+  // If RPC failed on a new request then the server is shutting down
+  // and so we should do nothing (including not registering for a new
+  // request). If RPC failed on a non-START step then there is nothing
+  // we can do since we one execute one step.
+  const bool shutdown = (!rpc_ok && (state->step_ == Steps::START));
+  if (shutdown) {
+    state->step_ = Steps::FINISH;
+  }
+
+  if (state->step_ == Steps::START) {
+    // Start a new request to replace this one...
+    if (!shutdown) {
+      StartNewRequest();
+    }
+
+    TRTSERVER_Error* err = nullptr;
+
+    std::string request_header_serialized;
+    if (!state->req_resp_.request_.meta_data().SerializeToString(
+            &request_header_serialized)) {
+      err = TRTSERVER_ErrorNew(
+          TRTSERVER_ERROR_UNKNOWN, "failed to serialize request header");
+    } else {
+      // Create the inference request provider which provides all the
+      // input information needed for an inference.
+      TRTSERVER_InferenceRequestProvider* request_provider = nullptr;
+      err = TRTSERVER_InferenceRequestProviderNew(
+          &request_provider, trtserver_.get(),
+          state->req_resp_.request_.model_name().c_str(), state->req_resp_.request_.model_version(),
+          request_header_serialized.c_str(), request_header_serialized.size());
+      if (err == nullptr) {
+        err = InferGRPCToInput(
+            trtserver_, smb_manager_, state->req_resp_.request_.meta_data(),
+            state->req_resp_.request_, request_provider);
+        if (err == nullptr) {
+          state->step_ = ISSUED;
+          err = TRTSERVER_ServerInferAsync(
+              trtserver_.get(), request_provider, allocator_,
+              &state->req_resp_.response_ /* response_allocator_userp */, InferComplete,
+              reinterpret_cast<void*>(state));
+
+          // The request provider can be deleted immediately after the
+          // ServerInferAsync call returns.
+          TRTSERVER_InferenceRequestProviderDelete(request_provider);
+        }
+      }
+    }
+
+    // If not error then state->step_ == ISSUED and inference request
+    // has initiated... completion callback will transition to
+    // COMPLETE. If error go immediately to COMPLETE.
+    if (err != nullptr) {
+      RequestStatusUtil::Create(
+          state->req_resp_.response_.mutable_request_status(), err, state->unique_id_,
+          server_id_);
+
+      LOG_VERBOSE(1) << "Infer failed: " << TRTSERVER_ErrorMessage(err);
+      TRTSERVER_ErrorDelete(err);
+
+      // Clear the meta-data and raw output as they may be partially
+      // or un-initialized.
+      state->req_resp_.response_.mutable_meta_data()->Clear();
+      state->req_resp_.response_.mutable_raw_output()->Clear();
+
+      state->req_resp_.response_.mutable_meta_data()->set_id(
+          state->req_resp_.request_.meta_data().id());
+
+      state->step_ = COMPLETE;
+      state->responder_->Finish(state->req_resp_.response_, grpc::Status::OK, state);
+    }
+  } else if (state->step_ == Steps::COMPLETE) {
+    state->step_ = Steps::FINISH;
+  }
+
+  return state->step_;
+}
+
 void
 InferHandler::InferComplete(
     TRTSERVER_Server* server, TRTSERVER_InferenceResponse* response,
     void* userp)
 {
-  Handler::State* state = reinterpret_cast<Handler::State*>(userp);
+  HandlerState<
+      grpc::ServerAsyncResponseWriter<InferResponse>, InferRequest,
+      InferResponse>* state =
+      reinterpret_cast<HandlerState<
+          grpc::ServerAsyncResponseWriter<InferResponse>, InferRequest,
+          InferResponse>*>(userp);
 
   LOG_VERBOSE(1) << "InferHandler::InferComplete, step " << state->step_;
 
   TRTSERVER_Error* response_status =
       TRTSERVER_InferenceResponseStatus(response);
   if ((response_status == nullptr) &&
-      (state->response_.ByteSizeLong() > INT_MAX)) {
+      (state->req_resp_.response_.ByteSizeLong() > INT_MAX)) {
     response_status = TRTSERVER_ErrorNew(
         TRTSERVER_ERROR_INVALID_ARG,
         std::string(
             "Response has byte size " +
-            std::to_string(state->response_.ByteSizeLong()) +
-            " which exceed gRPC's byte size limit " + std::to_string(INT_MAX) +
+            std::to_string(state->req_resp_.response_.ByteSizeLong()) +
+            " which exceeds gRPC's byte size limit " + std::to_string(INT_MAX) +
             ".")
             .c_str());
   }
@@ -741,7 +783,7 @@ InferHandler::InferComplete(
       response_status =
           TRTSERVER_ProtobufSerialize(response_protobuf, &buffer, &byte_size);
       if (response_status == nullptr) {
-        if (!state->response_.mutable_meta_data()->ParseFromArray(
+        if (!state->req_resp_.response_.mutable_meta_data()->ParseFromArray(
                 buffer, byte_size)) {
           response_status = TRTSERVER_ErrorNew(
               TRTSERVER_ERROR_INTERNAL, "failed to parse response header");
@@ -752,35 +794,246 @@ InferHandler::InferComplete(
     }
   }
 
-  // If the response is an error then clear the meta-data
-  // and raw output as they may be partially or
-  // un-initialized.
+  // If the response is an error then clear the meta-data and raw
+  // output as they may be partially or un-initialized.
   if (response_status != nullptr) {
-    state->response_.mutable_meta_data()->Clear();
-    state->response_.mutable_raw_output()->Clear();
+    state->req_resp_.response_.mutable_meta_data()->Clear();
+    state->req_resp_.response_.mutable_raw_output()->Clear();
   }
 
   RequestStatusUtil::Create(
-      state->response_.mutable_request_status(), response_status,
+      state->req_resp_.response_.mutable_request_status(), response_status,
       state->unique_id_, state->server_id_);
 
   LOG_IF_ERR(
       TRTSERVER_InferenceResponseDelete(response), "deleting GRPC response");
   TRTSERVER_ErrorDelete(response_status);
 
-  state->response_.mutable_meta_data()->set_id(
-      state->request_.meta_data().id());
+  state->req_resp_.response_.mutable_meta_data()->set_id(
+      state->req_resp_.request_.meta_data().id());
 
-  state->step_ = PROCESS2;
-  state->responder_->Finish(state->response_, grpc::Status::OK, state);
+  state->step_ = COMPLETE;
+  state->responder_->Finish(state->req_resp_.response_, grpc::Status::OK, state);
+}
+
+//
+// StreamInferHandler
+//
+class StreamInferHandler
+    : public Handler<
+          GRPCService::AsyncService,
+          grpc::ServerAsyncReaderWriter<InferResponse, InferRequest>,
+          InferRequest, InferResponse> {
+ public:
+  StreamInferHandler(
+      const std::string& name,
+      const std::shared_ptr<TRTSERVER_Server>& trtserver, const char* server_id,
+      const std::shared_ptr<SharedMemoryBlockManager>& smb_manager,
+      GRPCService::AsyncService* service, grpc::ServerCompletionQueue* cq,
+      size_t max_state_bucket_count)
+      : Handler(
+            name, trtserver, server_id, smb_manager, service, cq,
+            max_state_bucket_count)
+  {
+    // Create the allocator that will be used to allocate buffers for
+    // the result tensors.
+    FAIL_IF_ERR(
+        TRTSERVER_ResponseAllocatorNew(
+            &allocator_, InferResponseAlloc, InferResponseRelease),
+        "creating response allocator");
+  }
+
+ protected:
+  void StartNewRequest();
+  Steps Process(State* state, bool rpc_ok);
+
+ private:
+  static void StreamInferComplete(
+      TRTSERVER_Server* server, TRTSERVER_InferenceResponse* response,
+      void* userp);
+
+  TRTSERVER_ResponseAllocator* allocator_;
+};
+
+void
+StreamInferHandler::StartNewRequest()
+{
+  LOG_VERBOSE(1) << "New request handler for " << Name();
+
+  State* state = StateNew();
+  service_->RequestStreamInfer(
+      state->ctx_.get(), state->responder_.get(), cq_, cq_, state);
+}
+
+Steps
+StreamInferHandler::Process(Handler::State* state, bool rpc_ok)
+{
+  LOG_VERBOSE(1) << "Process for " << Name() << ", rpc_ok=" << rpc_ok
+                 << ", step " << state->step_;
+
+  // If RPC failed on a new request then the server is shutting down
+  // and so we should do nothing (including not registering for a new
+  // request). If RPC failed on a non-START step then there is nothing
+  // we can do since we one execute one step.
+  const bool shutdown = (!rpc_ok && (state->step_ == Steps::START));
+  if (shutdown) {
+    state->step_ = Steps::FINISH;
+  }
+
+  if (state->step_ == Steps::START) {
+    // Start a new request to replace this one...
+    if (!shutdown) {
+      StartNewRequest();
+    }
+
+    state->step_ = Steps::READ;
+    state->responder_->Read(&state->req_resp_.request_, state);
+
+  } else if (state->step_ == Steps::READ) {
+    TRTSERVER_Error* err = nullptr;
+
+    std::string request_header_serialized;
+    if (!state->req_resp_.request_.meta_data().SerializeToString(
+            &request_header_serialized)) {
+      err = TRTSERVER_ErrorNew(
+          TRTSERVER_ERROR_UNKNOWN, "failed to serialize request header");
+    } else {
+      // Create the inference request provider which provides all the
+      // input information needed for an inference.
+      TRTSERVER_InferenceRequestProvider* request_provider = nullptr;
+      err = TRTSERVER_InferenceRequestProviderNew(
+          &request_provider, trtserver_.get(),
+          state->req_resp_.request_.model_name().c_str(), state->req_resp_.request_.model_version(),
+          request_header_serialized.c_str(), request_header_serialized.size());
+      if (err == nullptr) {
+        err = InferGRPCToInput(
+            trtserver_, smb_manager_, state->req_resp_.request_.meta_data(),
+            state->req_resp_.request_, request_provider);
+        if (err == nullptr) {
+          state->step_ = ISSUED;
+          err = TRTSERVER_ServerInferAsync(
+              trtserver_.get(), request_provider, allocator_,
+              &state->req_resp_.response_ /* response_allocator_userp */,
+              StreamInferComplete, reinterpret_cast<void*>(state));
+
+          // The request provider can be deleted immediately after the
+          // ServerInferAsync call returns.
+          TRTSERVER_InferenceRequestProviderDelete(request_provider);
+        }
+      }
+    }
+
+    // If not error then state->step_ == ISSUED and inference request
+    // has initiated... completion callback will transition to
+    // COMPLETE. If error go immediately to COMPLETE.
+    if (err != nullptr) {
+      RequestStatusUtil::Create(
+          state->req_resp_.response_.mutable_request_status(), err, state->unique_id_,
+          server_id_);
+
+      LOG_VERBOSE(1) << "Infer failed: " << TRTSERVER_ErrorMessage(err);
+      TRTSERVER_ErrorDelete(err);
+
+      // Clear the meta-data and raw output as they may be partially
+      // or un-initialized.
+      state->req_resp_.response_.mutable_meta_data()->Clear();
+      state->req_resp_.response_.mutable_raw_output()->Clear();
+
+      state->req_resp_.response_.mutable_meta_data()->set_id(
+          state->req_resp_.request_.meta_data().id());
+
+      state->step_ = Steps::WRITE;
+      state->responder_->Write(state->req_resp_.response_, state);
+    }
+  } else if (state->step_ == Steps::WRITE) {
+    state->step_ = Steps::COMPLETE;
+    state->responder_->Finish(grpc::Status::OK, state);
+  } else if (state->step_ == Steps::COMPLETE) {
+    state->step_ = Steps::FINISH;
+  }
+
+  return state->step_;
+}
+
+void
+StreamInferHandler::StreamInferComplete(
+    TRTSERVER_Server* server, TRTSERVER_InferenceResponse* response,
+    void* userp)
+{
+  HandlerState<
+      grpc::ServerAsyncReaderWriter<InferResponse, InferRequest>, InferRequest,
+      InferResponse>* state =
+      reinterpret_cast<HandlerState<
+          grpc::ServerAsyncReaderWriter<InferResponse, InferRequest>,
+          InferRequest, InferResponse>*>(userp);
+
+  LOG_VERBOSE(1) << "StreamInferHandler::StreamInferComplete, step "
+                 << state->step_;
+
+  TRTSERVER_Error* response_status =
+      TRTSERVER_InferenceResponseStatus(response);
+  if ((response_status == nullptr) &&
+      (state->req_resp_.response_.ByteSizeLong() > INT_MAX)) {
+    response_status = TRTSERVER_ErrorNew(
+        TRTSERVER_ERROR_INVALID_ARG,
+        std::string(
+            "Response has byte size " +
+            std::to_string(state->req_resp_.response_.ByteSizeLong()) +
+            " which exceeds gRPC's byte size limit " + std::to_string(INT_MAX) +
+            ".")
+            .c_str());
+  }
+
+  if (response_status == nullptr) {
+    TRTSERVER_Protobuf* response_protobuf = nullptr;
+    response_status =
+        TRTSERVER_InferenceResponseHeader(response, &response_protobuf);
+    if (response_status == nullptr) {
+      const char* buffer;
+      size_t byte_size;
+      response_status =
+          TRTSERVER_ProtobufSerialize(response_protobuf, &buffer, &byte_size);
+      if (response_status == nullptr) {
+        if (!state->req_resp_.response_.mutable_meta_data()->ParseFromArray(
+                buffer, byte_size)) {
+          response_status = TRTSERVER_ErrorNew(
+              TRTSERVER_ERROR_INTERNAL, "failed to parse response header");
+        }
+      }
+
+      TRTSERVER_ProtobufDelete(response_protobuf);
+    }
+  }
+
+  // If the response is an error then clear the meta-data and raw
+  // output as they may be partially or un-initialized.
+  if (response_status != nullptr) {
+    state->req_resp_.response_.mutable_meta_data()->Clear();
+    state->req_resp_.response_.mutable_raw_output()->Clear();
+  }
+
+  RequestStatusUtil::Create(
+      state->req_resp_.response_.mutable_request_status(), response_status,
+      state->unique_id_, state->server_id_);
+
+  LOG_IF_ERR(
+      TRTSERVER_InferenceResponseDelete(response), "deleting GRPC response");
+  TRTSERVER_ErrorDelete(response_status);
+
+  state->req_resp_.response_.mutable_meta_data()->set_id(
+      state->req_resp_.request_.meta_data().id());
+
+  state->step_ = Steps::WRITE;
+  state->responder_->Write(state->req_resp_.response_, state);
 }
 
 //
 // ProfileHandler
 //
-class ProfileHandler
-    : public Handler<
-          GRPCService::AsyncService, ProfileRequest, ProfileResponse> {
+class ProfileHandler : public Handler<
+                           GRPCService::AsyncService,
+                           grpc::ServerAsyncResponseWriter<ProfileResponse>,
+                           ProfileRequest, ProfileResponse> {
  public:
   ProfileHandler(
       const std::string& name,
@@ -806,7 +1059,7 @@ ProfileHandler::StartNewRequest()
 
   State* state = StateNew();
   service_->RequestProfile(
-      state->ctx_.get(), &state->request_, state->responder_.get(), cq_, cq_,
+      state->ctx_.get(), &state->req_resp_.request_, state->responder_.get(), cq_, cq_,
       state);
 }
 
@@ -829,12 +1082,12 @@ ProfileHandler::Process(Handler::State* state, bool rpc_ok)
     // For now profile is a nop...
 
     RequestStatusUtil::Create(
-        state->response_.mutable_request_status(), nullptr /* success */,
+        state->req_resp_.response_.mutable_request_status(), nullptr /* success */,
         state->unique_id_, server_id_);
 
-    state->step_ = Steps::PROCESS1;
-    state->responder_->Finish(state->response_, grpc::Status::OK, state);
-  } else if (state->step_ == Steps::PROCESS1) {
+    state->step_ = Steps::COMPLETE;
+    state->responder_->Finish(state->req_resp_.response_, grpc::Status::OK, state);
+  } else if (state->step_ == Steps::COMPLETE) {
     state->step_ = Steps::FINISH;
   }
 
@@ -851,9 +1104,11 @@ ProfileHandler::Process(Handler::State* state, bool rpc_ok)
 //
 // ModelControlHandler
 //
-class ModelControlHandler : public Handler<
-                                GRPCService::AsyncService, ModelControlRequest,
-                                ModelControlResponse> {
+class ModelControlHandler
+    : public Handler<
+          GRPCService::AsyncService,
+          grpc::ServerAsyncResponseWriter<ModelControlResponse>,
+          ModelControlRequest, ModelControlResponse> {
  public:
   ModelControlHandler(
       const std::string& name,
@@ -879,7 +1134,7 @@ ModelControlHandler::StartNewRequest()
 
   State* state = StateNew();
   service_->RequestModelControl(
-      state->ctx_.get(), &state->request_, state->responder_.get(), cq_, cq_,
+      state->ctx_.get(), &state->req_resp_.request_, state->responder_.get(), cq_, cq_,
       state);
 }
 
@@ -900,23 +1155,23 @@ ModelControlHandler::Process(Handler::State* state, bool rpc_ok)
 
   if (state->step_ == START) {
     TRTSERVER_Error* err = nullptr;
-    if (state->request_.type() == ModelControlRequest::LOAD) {
+    if (state->req_resp_.request_.type() == ModelControlRequest::LOAD) {
       err = TRTSERVER_ServerLoadModel(
-          trtserver_.get(), state->request_.model_name().c_str());
+          trtserver_.get(), state->req_resp_.request_.model_name().c_str());
     } else {
       err = TRTSERVER_ServerUnloadModel(
-          trtserver_.get(), state->request_.model_name().c_str());
+          trtserver_.get(), state->req_resp_.request_.model_name().c_str());
     }
 
     RequestStatusUtil::Create(
-        state->response_.mutable_request_status(), err, state->unique_id_,
+        state->req_resp_.response_.mutable_request_status(), err, state->unique_id_,
         server_id_);
 
     TRTSERVER_ErrorDelete(err);
 
-    state->step_ = Steps::PROCESS1;
-    state->responder_->Finish(state->response_, grpc::Status::OK, state);
-  } else if (state->step_ == Steps::PROCESS1) {
+    state->step_ = Steps::COMPLETE;
+    state->responder_->Finish(state->req_resp_.response_, grpc::Status::OK, state);
+  } else if (state->step_ == Steps::COMPLETE) {
     state->step_ = Steps::FINISH;
   }
 
@@ -935,8 +1190,9 @@ ModelControlHandler::Process(Handler::State* state, bool rpc_ok)
 //
 class SharedMemoryControlHandler
     : public Handler<
-          GRPCService::AsyncService, SharedMemoryControlRequest,
-          SharedMemoryControlResponse> {
+          GRPCService::AsyncService,
+          grpc::ServerAsyncResponseWriter<SharedMemoryControlResponse>,
+          SharedMemoryControlRequest, SharedMemoryControlResponse> {
  public:
   SharedMemoryControlHandler(
       const std::string& name,
@@ -962,7 +1218,7 @@ SharedMemoryControlHandler::StartNewRequest()
 
   State* state = StateNew();
   service_->RequestSharedMemoryControl(
-      state->ctx_.get(), &state->request_, state->responder_.get(), cq_, cq_,
+      state->ctx_.get(), &state->req_resp_.request_, state->responder_.get(), cq_, cq_,
       state);
 }
 
@@ -985,20 +1241,20 @@ SharedMemoryControlHandler::Process(Handler::State* state, bool rpc_ok)
     TRTSERVER_SharedMemoryBlock* smb = nullptr;
 
     TRTSERVER_Error* err = nullptr;
-    switch (state->request_.type()) {
+    switch (state->req_resp_.request_.type()) {
       case SharedMemoryControlRequest::REGISTER:
         err = smb_manager_->Create(
-            &smb, state->request_.shared_memory_region().name(),
-            state->request_.shared_memory_region().shm_key(),
-            state->request_.shared_memory_region().offset(),
-            state->request_.shared_memory_region().byte_size());
+            &smb, state->req_resp_.request_.shared_memory_region().name(),
+            state->req_resp_.request_.shared_memory_region().shm_key(),
+            state->req_resp_.request_.shared_memory_region().offset(),
+            state->req_resp_.request_.shared_memory_region().byte_size());
         if (err == nullptr) {
           err = TRTSERVER_ServerRegisterSharedMemory(trtserver_.get(), smb);
         }
         break;
       case SharedMemoryControlRequest::UNREGISTER:
         err = smb_manager_->Remove(
-            &smb, state->request_.shared_memory_region().name());
+            &smb, state->req_resp_.request_.shared_memory_region().name());
         if ((err == nullptr) && (smb != nullptr)) {
           err = TRTSERVER_ServerUnregisterSharedMemory(trtserver_.get(), smb);
           TRTSERVER_Error* del_err = TRTSERVER_SharedMemoryBlockDelete(smb);
@@ -1022,14 +1278,14 @@ SharedMemoryControlHandler::Process(Handler::State* state, bool rpc_ok)
     }
 
     RequestStatusUtil::Create(
-        state->response_.mutable_request_status(), err, state->unique_id_,
+        state->req_resp_.response_.mutable_request_status(), err, state->unique_id_,
         server_id_);
 
     TRTSERVER_ErrorDelete(err);
 
-    state->step_ = Steps::PROCESS1;
-    state->responder_->Finish(state->response_, grpc::Status::OK, state);
-  } else if (state->step_ == Steps::PROCESS1) {
+    state->step_ = Steps::COMPLETE;
+    state->responder_->Finish(state->req_resp_.response_, grpc::Status::OK, state);
+  } else if (state->step_ == Steps::COMPLETE) {
     state->step_ = Steps::FINISH;
   }
 
@@ -1101,6 +1357,7 @@ GRPCServer::Start()
   health_cq_ = grpc_builder_.AddCompletionQueue();
   status_cq_ = grpc_builder_.AddCompletionQueue();
   infer_cq_ = grpc_builder_.AddCompletionQueue();
+  stream_infer_cq_ = grpc_builder_.AddCompletionQueue();
   profile_cq_ = grpc_builder_.AddCompletionQueue();
   modelcontrol_cq_ = grpc_builder_.AddCompletionQueue();
   shmcontrol_cq_ = grpc_builder_.AddCompletionQueue();
@@ -1128,6 +1385,13 @@ GRPCServer::Start()
       infer_cq_.get(), 1 /* max_state_bucket_count */);
   hinfer->Start(infer_thread_cnt_);
   infer_handler_.reset(hinfer);
+
+  // Handler for streaming inference requests.
+  StreamInferHandler* hstreaminfer = new StreamInferHandler(
+      "StreamInferHandler", server_, server_id_, smb_manager_, &service_,
+      stream_infer_cq_.get(), 1 /* max_state_bucket_count */);
+  hstreaminfer->Start(stream_infer_thread_cnt_);
+  stream_infer_handler_.reset(hstreaminfer);
 
   // Handler for profile requests. A single thread processes all of
   // these requests.
@@ -1172,6 +1436,7 @@ GRPCServer::Stop()
   health_cq_->Shutdown();
   status_cq_->Shutdown();
   infer_cq_->Shutdown();
+  stream_infer_cq_->Shutdown();
   profile_cq_->Shutdown();
   modelcontrol_cq_->Shutdown();
   shmcontrol_cq_->Shutdown();
@@ -1181,6 +1446,7 @@ GRPCServer::Stop()
   dynamic_cast<HealthHandler*>(health_handler_.get())->Stop();
   dynamic_cast<StatusHandler*>(status_handler_.get())->Stop();
   dynamic_cast<InferHandler*>(infer_handler_.get())->Stop();
+  dynamic_cast<StreamInferHandler*>(stream_infer_handler_.get())->Stop();
   dynamic_cast<ProfileHandler*>(profile_handler_.get())->Stop();
   dynamic_cast<ModelControlHandler*>(modelcontrol_handler_.get())->Stop();
   dynamic_cast<SharedMemoryControlHandler*>(shmcontrol_handler_.get())->Stop();
